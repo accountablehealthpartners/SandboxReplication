@@ -1,0 +1,43 @@
+# SOQL query to get Account IDs created today
+query = """
+SELECT Id FROM Account 
+WHERE CreatedDate >= 2024-09-17T00:00:00Z AND CreatedDate < 2024-09-18T00:00:00Z
+"""
+accounts_created_today = sand.query_all(query)['records']
+account_ids = [account['Id'] for account in accounts_created_today]
+
+print(f"Found {len(account_ids)} accounts created that day.")
+
+
+
+
+  
+from tqdm import tqdm
+
+# Prepare the list of dictionaries for deletion
+accounts_to_delete = [{'Id': account_id} for account_id in account_ids]
+
+# Batch size (you can adjust this based on performance)
+batch_size = 100
+
+# Perform the bulk delete operation with a progress bar in batches
+try:
+    delete_results = []
+    for i in tqdm(range(0, len(accounts_to_delete), batch_size), desc="Deleting Accounts", unit="batch"):
+        batch = accounts_to_delete[i:i + batch_size]
+        result = sand.bulk.Account.delete(batch)
+        delete_results.extend(result)
+
+    successful_deletes = sum(1 for result in delete_results if result['success'])
+    failed_deletes = len(delete_results) - successful_deletes
+
+    print(f"\nSuccessfully deleted {successful_deletes} accounts.")
+    if failed_deletes > 0:
+        print(f"Failed to delete {failed_deletes} accounts.")
+        for result in delete_results:
+            if not result['success']:
+                print(f"Failed to delete account with Id {result['id']} due to: {result['errors']}")
+except Exception as e:
+    print("An error occurred during the deletion of accounts:", str(e))
+
+  
