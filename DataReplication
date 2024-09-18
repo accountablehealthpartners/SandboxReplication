@@ -1,0 +1,512 @@
+### Logging into Salesforce ###
+
+
+
+
+import pandas as pd
+from simple_salesforce import Salesforce
+import requests
+import os
+import Salesforce_Credentials as creds
+
+# Authenticate to Salesforce Production
+sf = Salesforce(
+    username=creds.SF_USERNAME,
+    password=creds.SF_PASSWORD,
+    security_token=creds.SF_SECURITY_TOKEN,
+    domain='login'  # Use 'test' for sandbox and 'login' for production
+)
+
+sand = Salesforce(
+    username=creds.SAND_USERNAME,
+    password=creds.SAND_PASSWORD,
+    security_token=creds.SAND_SECURITY_TOKEN,
+    domain='test'  # Use 'test' for sandbox and 'login' for production
+)
+
+
+
+
+### Copying in the Accounts ###
+
+
+# Query existing accounts from Salesforce Production
+accounts = sf.query_all("""
+SELECT Id, Name, Type, BillingStreet, BillingCity, BillingState, BillingPostalCode, BillingCountry,
+BillingLatitude, BillingLongitude, ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, ShippingLatitude, ShippingLongitude, 
+Phone, Fax, AccountNumber, Website, Sic, Industry, ParentId,
+RecordTypeId, BillingGeocodeAccuracy, ShippingGeocodeAccuracy, 
+AnnualRevenue, NumberOfEmployees, Ownership, TickerSymbol, Description, Rating, Site,
+Jigsaw, AccountSource, SicDesc, 
+Account_Network_End_Date__c, Account_Network_Start_Date__c, 
+Account_Number__c, Account_Participant_Status__c, Account_Specialty__c, CMO_Group__c, CT_CTA__c, 
+Care_Mgmt__c, Category__c, Contact__c, County_NYS__c, EMR__c, Epic_Name__c, Excellus_Location_Name__c, 
+Fax__c, IB_TCM_Pool_Name__c, Lab_Collection_Site__c, Practice_Resources__c, Legacy_Org_PL__c, 
+Legal_TIN_Name__c, MRI_MRA__c, Mammography__c, Network_Status__c, Open_MRI_MRA__c, Other_Phone__c, 
+PCMH_Expires__c, PCMH__c, PCN_Location__c, PET_CT__c, Practice_Management_System__c, 
+Practice_NPI_Group__c, Practice_TIN__c, Radiology_Services__c, SafetyNet_Practice__c, 
+Suppress_from_Online_Directory__c, System_Affiliation__c, URMC_eRecord_Dept_ID__c, URMC_eRecord_Dept_Name__c, 
+Ultrasound__c, X_Ray__c, eRecord_ID__c, eRecord_PCP_Dep__c, 
+Account_Legacy_Org_Id__c, 
+Name_Address_Key__c, Practice_Location_Legacy_Org_Id__c, 
+Primary_Care_Location__c, Physical_Therapy_Services__c, AHP_Embedded_CM__c
+FROM Account
+""")
+account_data = [record for record in accounts['records']]
+
+# Filter out accounts with the specific RecordTypeId
+filtered_accounts = [acc for acc in account_data if acc['RecordTypeId'] != '012Dn000000FGWtIAO']
+
+# Prepare data for insertion, separating parent (no ParentId) and child accounts
+parent_accounts = []
+child_accounts = []
+for account in filtered_accounts:
+    # Update Account Specialty if it's 'Ob Gyn' or 'Pediatric Developmental'
+    if account.get('Account_Specialty__c') == 'Ob Gyn':
+        account['Account_Specialty__c'] = 'Obstetrics/Gynecology'
+    if account.get('Account_Specialty__c') == 'Pediatric Developmental':
+        account['Account_Specialty__c'] = 'Pediatrics Developmental'
+    
+    # Separate parent and child accounts
+    if account['ParentId'] is None:
+        parent_accounts.append(account)
+    else:
+        child_accounts.append(account)
+
+# Store original parent and child IDs
+original_parent_ids = [acc['Id'] for acc in parent_accounts]
+original_child_ids = [acc['Id'] for acc in child_accounts]
+id_mapping = {}  # This will map original IDs to new IDs
+failed_insertions = []  # List to store failed insertions
+
+# Remove 'Id' from parent and child accounts before insertion
+for account in parent_accounts + child_accounts:
+    account.pop('Id', None)  # Remove the original Salesforce ID
+
+# Insert parent accounts into the sandbox and map old AccountId to new AccountId
+try:
+    insert_results = sand.bulk.Account.insert(parent_accounts)
+    for original_id, result in zip(original_parent_ids, insert_results):
+        if result['success']:
+            id_mapping[original_id] = result['id']
+        else:
+            failed_row = next(acc for acc in parent_accounts if acc.get('Id') == original_id)
+            failed_row['Error'] = result['errors']
+            failed_insertions.append(failed_row)
+            print(f"Failed to insert parent account with ID {original_id} due to: {result['errors']}")
+except Exception as e:
+    print("An error occurred during the insertion of parent accounts:", str(e))
+
+# Update child accounts with new ParentId from mapping
+valid_child_accounts = []
+for account in child_accounts:
+    if account['ParentId'] in id_mapping:
+        account['ParentId'] = id_mapping[account['ParentId']]
+        valid_child_accounts.append(account)
+    else:
+        print(f"No new ParentId mapped for old ParentId {account['ParentId']} - account may not be linked properly.")
+
+# Insert child accounts into the sandbox and map old AccountId to new AccountId
+try:
+    insert_child_results = sand.bulk.Account.insert(valid_child_accounts)
+    for original_id, result in zip(original_child_ids, insert_child_results):
+        if result['success']:
+            id_mapping[original_id] = result['id']
+        else:
+            failed_row = next(acc for acc in child_accounts if acc.get('Id') == original_id)
+            failed_row['Error'] = result['errors']
+            failed_insertions.append(failed_row)
+            print(f"Failed to insert child account with ID {original_id} due to: {result['errors']}")
+except Exception as e:
+    print("An error occurred during the insertion of child accounts:", str(e))
+
+# Now, update the newly created records with all other fields from the production environment
+# Prepare data for update using the id_mapping to find the correct records in the sandbox
+update_accounts = []
+for original_id, new_id in id_mapping.items():
+    matching_record = next((acc for acc in account_data if acc.get('Id') == original_id), None)
+    if matching_record:
+        matching_record['NewId'] = new_id  # Store the new sandbox ID temporarily in a new field
+        update_accounts.append(matching_record)
+
+# Perform the bulk update operation
+try:
+    update_results = sand.bulk.Account.update(update_accounts)
+    for record, result in zip(update_accounts, update_results):
+        if not result['success']:
+            record['Error'] = result['errors']
+            failed_insertions.append(record)
+            print(f"Failed to update account with Id {record.get('NewId', '')} due to: {result['errors']}")
+except Exception as e:
+    print("An error occurred during the update of accounts:", str(e))
+
+# Create a DataFrame of all failed insertions and updates
+failed_updates_df = pd.DataFrame(failed_insertions)
+
+# Display or save the DataFrame of failed accounts
+print(f"Total accounts failed to insert or update: {len(failed_insertions)}")
+print(failed_updates_df)
+
+# Save to CSV for further review
+failed_updates_df.to_csv('C://Users//jkim436//Downloads//failed_accounts.csv', index=False)
+
+
+
+
+### Check if all the Account Object items moved over correctly ###
+
+
+
+
+from datetime import datetime
+
+# Get today's date in the format required by Salesforce (YYYY-MM-DD)
+#today = datetime.today().strftime('%Y-%m-%d')
+
+# SOQL query to get Account IDs created today
+query = """
+SELECT Id FROM Account 
+WHERE CreatedDate >= 2024-09-17T00:00:00Z AND CreatedDate < 2024-09-18T00:00:00Z
+"""
+accounts_created_today = sand.query_all(query)['records']
+account_ids = [account['Id'] for account in accounts_created_today]
+
+print(f"Found {len(account_ids)} accounts created that day.")
+
+from simple_salesforce import Salesforce
+import pandas as pd
+
+# Assuming Salesforce connections to Production (sf) and Sandbox (sand) are already established
+
+# Query production accounts to get necessary fields
+prod_accounts = sf.query_all("""
+SELECT Id, Name, Practice_TIN__c, 
+ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry 
+FROM Account
+""")
+
+# Create a key based on Name, Practice_TIN__c, and full ShippingAddress in Production
+prod_account_map = {
+    (
+        acc['Name'],
+        acc['Practice_TIN__c'],
+        f"{acc.get('ShippingStreet', '')}, {acc.get('ShippingCity', '')}, {acc.get('ShippingState', '')}, {acc.get('ShippingPostalCode', '')}, {acc.get('ShippingCountry', '')}"
+    ): acc['Id']
+    for acc in prod_accounts['records']
+}
+
+# Query sandbox accounts to get the same fields
+sandbox_accounts = sand.query_all("""
+SELECT Id, Name, Practice_TIN__c, 
+ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry 
+FROM Account
+""")
+
+# Prepare sandbox updates based on matching key
+sandbox_updates = []
+sandbox_to_prod_map = {}  # For keeping track of the mappings
+
+for sandbox_account in sandbox_accounts['records']:
+    # Create the matching key for Sandbox accounts
+    sandbox_key = (
+        sandbox_account['Name'],
+        sandbox_account['Practice_TIN__c'],
+        f"{sandbox_account.get('ShippingStreet', '')}, {sandbox_account.get('ShippingCity', '')}, {sandbox_account.get('ShippingState', '')}, {sandbox_account.get('ShippingPostalCode', '')}, {sandbox_account.get('ShippingCountry', '')}"
+    )
+
+    # Check if the key exists in production map
+    if sandbox_key in prod_account_map:
+        production_id = prod_account_map[sandbox_key]
+        # Assuming AccountId__c is used to map production AccountId in Sandbox
+        sandbox_updates.append({
+            'Id': sandbox_account['Id'],
+            'AccountId__c': production_id  # Update to the correct Production AccountId
+        })
+        sandbox_to_prod_map[sandbox_account['Id']] = production_id
+    else:
+        print(f"No matching production account found for Sandbox Account ID {sandbox_account['Id']} with key: {sandbox_key}")
+
+# Create a list of dictionaries to store mapping results
+mapping_results = []
+
+for sandbox_id, production_id in sandbox_to_prod_map.items():
+    matching_sandbox_account = next((acc for acc in sandbox_accounts['records'] if acc['Id'] == sandbox_id), None)
+    if matching_sandbox_account:
+        shipping_address = f"{matching_sandbox_account.get('ShippingStreet', '')}, {matching_sandbox_account.get('ShippingCity', '')}, {matching_sandbox_account.get('ShippingState', '')}, {matching_sandbox_account.get('ShippingPostalCode', '')}, {matching_sandbox_account.get('ShippingCountry', '')}"
+        mapping_results.append({
+            'SandboxAccountId': sandbox_id,
+            'ProductionAccountId': production_id,
+            'Name': matching_sandbox_account['Name'],
+            'Practice_TIN__c': matching_sandbox_account['Practice_TIN__c'],
+            'ShippingAddress': shipping_address
+        })
+
+# Convert the list of dictionaries into a DataFrame named account_id_mapping
+account_id_mapping = pd.DataFrame(mapping_results)
+
+# Display or use the DataFrame
+print(account_id_mapping)
+
+
+
+
+
+### Copying in the Contacts ###
+
+
+
+import math
+import pandas as pd
+
+# Function to split the contact data into smaller batches
+def batch_data(data, batch_size):
+    """Yield successive batch_size-sized chunks from data."""
+    for i in range(0, len(data), batch_size):
+        yield data[i:i + batch_size]
+
+# Assuming `account_id_mapping` is a DataFrame with 'ProductionAccountId' and 'SandboxAccountId'
+# Convert it into a dictionary for easier lookup
+account_id_mapping_dict = dict(zip(account_id_mapping['ProductionAccountId'], account_id_mapping['SandboxAccountId']))
+
+# Query contacts from Salesforce production
+contacts = sf.query_all("""
+SELECT Id,
+AccountId,
+LastName,
+FirstName,
+Salutation,
+MiddleName,
+Suffix,
+RecordTypeId,
+OtherStreet,
+OtherCity,
+OtherState,
+OtherPostalCode,
+OtherCountry,
+OtherLatitude,
+OtherLongitude,
+OtherGeocodeAccuracy,
+MailingStreet,
+MailingCity,
+MailingState,
+MailingPostalCode,
+MailingCountry,
+MailingLatitude,
+MailingLongitude,
+MailingGeocodeAccuracy,
+Phone,
+Fax,
+MobilePhone,
+HomePhone,
+OtherPhone,
+AssistantPhone,
+ReportsToId,
+Email,
+Title,
+Department,
+AssistantName,
+LeadSource,
+Birthdate,
+Description,
+OwnerId,
+HasOptedOutOfEmail,
+HasOptedOutOfFax,
+DoNotCall,
+EmailBouncedReason,
+EmailBouncedDate,
+Jigsaw,
+IndividualId,
+Pronouns,
+GenderIdentity,
+AHP_Medical_Staff_Membership_2__c,
+AHP_Medical_Staff_Membership__c,
+Accepting_New_Patients__c,
+Active_Contract_Count__c,
+Contract_Participant__c,
+Credentials__c,
+Deceased_Date__c,
+Direct_Fax__c,
+Email_2__c,
+Gender__c,
+Home_City__c,
+Home_State__c,
+Home_Zip_Code__c,
+Key_Words__c,
+Last_Primary_Care_Location__c,
+Legacy_Org_Id__c,
+Malpractice_Carrier__c,
+NPI__c,
+Network_Participation_Status__c,
+Admin_Asst__c,
+Other_Medical_Staff_Membership__c,
+Personal_Mobile__c,
+Participant_Network_End_Date__c,
+Participant_Network_Start_Date__c,
+Practice_Location_End_Date__c,
+Practice_Location_Start_Date__c,
+Preferred_Email_Address__c,
+Primary_Care_Provider__c,
+Primary_Prac_Loc_for_this_Provider__c,
+Provider_Role__c,
+Role__c,
+Second_Taxonomy__c,
+Specialty_2__c,
+Specialty__c,
+Suppress_from_Contact_Directory_All_Loc__c,
+Suppress_from_Online_Directory__c,
+Taxonomy__c,
+Term_Reason__c,
+Title__c,
+URID__c,
+URMC_Username__c,
+UR_NetID__c,
+Web_Commentary__c,
+Web_Publish__c,
+Work_Email__c,
+Work_Fax__c,
+Work_Mobile__c,
+Work_Phone__c,
+Employment_End_Date__c,
+Employment_Start_Date__c,
+Emergency_Contact_1__c,
+Emergency_Contact_1_Phone__c,
+Emergency_Contact_2__c,
+Emergency_Contact_2_Phone__c,
+AHP_Percentage__c,
+HomeStreet__c
+FROM Contact
+""")
+contact_data = [record for record in contacts['records']]
+
+# Track original ContactId to new ContactId mappings
+contact_id_mapping = {}
+failed_contacts = []  # List to store failed contacts
+
+# Update AccountId to the new SandboxAccountId using account_id_mapping_dict
+for contact in contact_data:
+    original_contact_id = contact['Id']  # Capture the original ContactId before removing 'Id'
+    
+    # Update AccountId if the ProductionAccountId matches in the mapping
+    if contact['AccountId'] in account_id_mapping_dict:
+        contact['AccountId'] = account_id_mapping_dict[contact['AccountId']]
+    
+    # Remove unnecessary fields
+    contact.pop('attributes', None)
+    contact.pop('Id', None)  # Remove the original Salesforce ID
+    
+    # Initialize the mapping with the original ContactId
+    contact_id_mapping[original_contact_id] = None
+
+# Estimate the batch size to be within the 10 MB limit
+batch_size = 1000  # Start with 1000 records per batch, adjust as necessary
+
+# Insert contacts into the sandbox in batches
+inserted_contact_ids = []
+try:
+    for batch in batch_data(contact_data, batch_size):
+        insert_results = sand.bulk.Contact.insert(batch)
+        for original_contact, result in zip(batch, insert_results):
+            original_contact_id = next((k for k, v in contact_id_mapping.items() if v is None), None)  # Retrieve the original ContactId
+            if result['success']:
+                new_id = result['id']
+                inserted_contact_ids.append(new_id)
+                # Map the original ContactId to the new ContactId
+                contact_id_mapping[original_contact_id] = new_id
+            else:
+                # Add failed contact information including error details
+                failed_contact = original_contact.copy()  # Copy to avoid modifying the original batch
+                failed_contact['Error'] = result['errors']
+                failed_contacts.append(failed_contact)
+                print(f"Failed to insert contact due to: {result['errors']}")
+        print(f"Successfully inserted {len(inserted_contact_ids)} contacts so far.")
+except Exception as e:
+    print("An error occurred during the insertion of contacts:", str(e))
+
+print(f"Total contacts inserted: {len(inserted_contact_ids)}")
+
+# Create a DataFrame of failed contacts
+failed_contacts_df = pd.DataFrame(failed_contacts)
+
+# Display or save the DataFrame of failed contacts
+print(f"Total contacts failed to insert: {len(failed_contacts)}")
+print(failed_contacts_df)
+
+# You can save the failed_contacts_df to a CSV for further analysis if needed
+#failed_contacts_df.to_csv('C://Users//jkim436//Downloads//failed_contacts.csv', index=False)
+
+
+
+
+### Copying in the ACRs ###
+
+
+
+# Query AccountContactRelation records from Salesforce production
+account_contact_relations = sf.query_all("""
+SELECT Id,
+AccountId,
+ContactId,
+Roles,
+IsActive,
+StartDate,
+EndDate,
+Accepting_New_Patients__c,
+Account_Contact_Type__c,
+Direct_Fax__c,
+CM_Directory_Contact__c,
+Payment_Contact__c,
+Legacy_Staff_Id__c,
+Office_Staff_Role__c,
+ACRProvider_Role__c,
+Suppress_from_Contact_Directory_All_Loc__c,
+Suppress_from_Contact_Directory__c,
+Suppress_from_Online_Directory_All_Loc__c,
+Work_Email__c,
+Work_Fax__c,
+Work_Mobile__c,
+Work_Phone__c,
+Legacy_PLP_Id__c,
+PLP_is_Active__c,
+Last_Primary_Care_Location__c,
+Site_Medical_Director__c,
+Roster_Update_Contact__c
+FROM AccountContactRelation
+""")
+acr_data = [record for record in account_contact_relations['records']]
+
+# Prepare the AccountContactRelation data for insertion into the sandbox
+acr_sandbox_data = []
+for acr in acr_data:
+    new_account_id = account_id_mapping_dict.get(acr['AccountId'])
+    new_contact_id = contact_id_mapping.get(acr['ContactId'])
+    
+    if new_account_id and new_contact_id:
+        # Map old AccountId and ContactId to new ones
+        acr['AccountId'] = new_account_id
+        acr['ContactId'] = new_contact_id
+        
+        # Remove Salesforce-generated fields before insertion
+        acr.pop('Id', None)
+        acr.pop('attributes', None)
+        
+        acr_sandbox_data.append(acr)
+    else:
+        print(f"Mapping not found for ACR record with AccountId {acr['AccountId']} and ContactId {acr['ContactId']}")
+
+# Insert AccountContactRelation records into the sandbox in batches
+batch_size = 1000
+inserted_acr_ids = []
+try:
+    for batch in batch_data(acr_sandbox_data, batch_size):
+        insert_results = sand.bulk.AccountContactRelation.insert(batch)
+        for acr_record, result in zip(batch, insert_results):
+            if result['success']:
+                inserted_acr_ids.append(result['id'])
+            else:
+                print(f"Failed to insert ACR record due to: {result['errors']}")
+        print(f"Successfully inserted {len(inserted_acr_ids)} AccountContactRelation records so far.")
+except Exception as e:
+    print("An error occurred during the insertion of AccountContactRelation records:", str(e))
+
+print(f"Total AccountContactRelation records inserted: {len(inserted_acr_ids)}")
+
