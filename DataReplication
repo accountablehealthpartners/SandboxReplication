@@ -441,72 +441,182 @@ print(failed_contacts_df)
 
 
 
-# Query AccountContactRelation records from Salesforce production
-account_contact_relations = sf.query_all("""
-SELECT Id,
-AccountId,
-ContactId,
-Roles,
-IsActive,
-StartDate,
-EndDate,
-Accepting_New_Patients__c,
-Account_Contact_Type__c,
-Direct_Fax__c,
-CM_Directory_Contact__c,
-Payment_Contact__c,
-Legacy_Staff_Id__c,
-Office_Staff_Role__c,
-ACRProvider_Role__c,
-Suppress_from_Contact_Directory_All_Loc__c,
-Suppress_from_Contact_Directory__c,
-Suppress_from_Online_Directory_All_Loc__c,
-Work_Email__c,
-Work_Fax__c,
-Work_Mobile__c,
-Work_Phone__c,
-Legacy_PLP_Id__c,
-PLP_is_Active__c,
-Last_Primary_Care_Location__c,
-Site_Medical_Director__c,
-Roster_Update_Contact__c
+# Step 1: Query AccountContactRelation object from Salesforce Production
+prod_acr_records = sf.query_all("""
+SELECT Id, AccountId, ContactId, Roles, IsActive, StartDate, EndDate, 
+Accepting_New_Patients__c, Account_Contact_Type__c, Direct_Fax__c, CM_Directory_Contact__c, 
+Payment_Contact__c, Legacy_Staff_Id__c, Office_Staff_Role__c, ACRProvider_Role__c, 
+Suppress_from_Contact_Directory_All_Loc__c, Suppress_from_Contact_Directory__c, 
+Suppress_from_Online_Directory_All_Loc__c, Work_Email__c, Work_Fax__c, Work_Mobile__c, 
+Work_Phone__c, Legacy_PLP_Id__c, PLP_is_Active__c, Last_Primary_Care_Location__c, 
+Site_Medical_Director__c, Roster_Update_Contact__c
 FROM AccountContactRelation
 """)
-acr_data = [record for record in account_contact_relations['records']]
+prod_acr_data = [record for record in prod_acr_records['records']]
 
-# Prepare the AccountContactRelation data for insertion into the sandbox
-acr_sandbox_data = []
-for acr in acr_data:
-    new_account_id = account_id_mapping_dict.get(acr['AccountId'])
-    new_contact_id = contact_id_mapping.get(acr['ContactId'])
+# Step 2: Use the matched contacts DataFrame to create a mapping of Production ContactId to Sandbox ContactId
+# matched_contacts_df contains 'Id_Prod' and 'Id_Sandbox' columns
+
+contact_id_remap = dict(zip(matched_contacts_df['Id_Prod'], matched_contacts_df['Id_Sandbox']))
+
+# Step 3: Remap the AccountId and ContactId to their Sandbox equivalents
+sandbox_acr_data = []
+failed_remaps = []
+
+for acr in prod_acr_data:
+    new_acr = acr.copy()  # Make a copy of the production record
     
-    if new_account_id and new_contact_id:
-        # Map old AccountId and ContactId to new ones
-        acr['AccountId'] = new_account_id
-        acr['ContactId'] = new_contact_id
-        
-        # Remove Salesforce-generated fields before insertion
-        acr.pop('Id', None)
-        acr.pop('attributes', None)
-        
-        acr_sandbox_data.append(acr)
+    # Remap AccountId using the existing account_id_mapping_dict
+    prod_account_id = acr.get('AccountId')
+    if prod_account_id in account_id_mapping_dict:
+        new_acr['AccountId'] = account_id_mapping_dict[prod_account_id]
     else:
-        print(f"Mapping not found for ACR record with AccountId {acr['AccountId']} and ContactId {acr['ContactId']}")
+        print(f"Failed to remap AccountId {prod_account_id}")
+        failed_remaps.append(new_acr)
+        continue
+    
+    # Remap ContactId using the contact_id_remap based on FullName matching
+    prod_contact_id = acr.get('ContactId')
+    if prod_contact_id in contact_id_remap:
+        new_acr['ContactId'] = contact_id_remap[prod_contact_id]
+    else:
+        print(f"Failed to remap ContactId {prod_contact_id}")
+        failed_remaps.append(new_acr)
+        continue
+    
+    # Remove the 'Id' field as it cannot be used in Sandbox insertions
+    new_acr.pop('Id', None)
+    
+    # Add the remapped record to the new list
+    sandbox_acr_data.append(new_acr)
 
-# Insert AccountContactRelation records into the sandbox in batches
-batch_size = 1000
-inserted_acr_ids = []
+# Step 4: Insert the remapped AccountContactRelation records into the Sandbox
 try:
-    for batch in batch_data(acr_sandbox_data, batch_size):
-        insert_results = sand.bulk.AccountContactRelation.insert(batch)
-        for acr_record, result in zip(batch, insert_results):
-            if result['success']:
-                inserted_acr_ids.append(result['id'])
-            else:
-                print(f"Failed to insert ACR record due to: {result['errors']}")
-        print(f"Successfully inserted {len(inserted_acr_ids)} AccountContactRelation records so far.")
+    insert_results = sand.bulk.AccountContactRelation.insert(sandbox_acr_data)
+    failed_inserts = []
+    for record, result in zip(sandbox_acr_data, insert_results):
+        if not result['success']:
+            record['Error'] = result['errors']
+            failed_inserts.append(record)
+            print(f"Failed to insert AccountContactRelation: {result['errors']}")
 except Exception as e:
-    print("An error occurred during the insertion of AccountContactRelation records:", str(e))
+    print(f"An error occurred during the insertion of AccountContactRelation records: {str(e)}")
 
-print(f"Total AccountContactRelation records inserted: {len(inserted_acr_ids)}")
+# Step 5: Handle failed inserts (if needed)
+if failed_inserts:
+    failed_inserts_df = pd.DataFrame(failed_inserts)
+    failed_inserts_df.to_csv('C://Users//jkim436//Downloads//failed_acr_insertions.csv', index=False)
 
+print(f"Total AccountContactRelation records inserted: {len(sandbox_acr_data) - len(failed_inserts)}")
+print(f"Total AccountContactRelation records failed to insert: {len(failed_inserts)}")
+
+# Save failed remaps for further analysis if necessary
+if failed_remaps:
+    failed_remaps_df = pd.DataFrame(failed_remaps)
+    failed_remaps_df.to_csv('C://Users//jkim436//Downloads//failed_acr_remaps.csv', index=False)
+
+print(f"Total records failed to remap: {len(failed_remaps)}")
+
+
+
+
+
+
+
+### Updating ACRs that have Missing Values ###
+
+
+
+
+
+
+import pandas as pd
+from simple_salesforce import Salesforce
+
+# Step 1: Query AccountContactRelation object from Salesforce Production
+prod_acr_records = sf.query_all("""
+SELECT Id, AccountId, ContactId, Roles, IsActive, StartDate, EndDate, 
+Accepting_New_Patients__c, Account_Contact_Type__c, Direct_Fax__c, CM_Directory_Contact__c, 
+Payment_Contact__c, Legacy_Staff_Id__c, Office_Staff_Role__c, ACRProvider_Role__c, 
+Suppress_from_Contact_Directory_All_Loc__c, Suppress_from_Contact_Directory__c, 
+Suppress_from_Online_Directory_All_Loc__c, Work_Email__c, Work_Fax__c, Work_Mobile__c, 
+Work_Phone__c, Legacy_PLP_Id__c, PLP_is_Active__c, Last_Primary_Care_Location__c, 
+Site_Medical_Director__c, Roster_Update_Contact__c
+FROM AccountContactRelation
+""")
+prod_acr_df = pd.DataFrame(prod_acr_records['records'])
+
+# Step 2: Query AccountContactRelation object from Salesforce Sandbox
+sandbox_acr_records = sand.query_all("""
+SELECT Id, AccountId, ContactId, Roles, IsActive, StartDate, EndDate, 
+Accepting_New_Patients__c, Account_Contact_Type__c, Direct_Fax__c, CM_Directory_Contact__c, 
+Payment_Contact__c, Legacy_Staff_Id__c, Office_Staff_Role__c, ACRProvider_Role__c, 
+Suppress_from_Contact_Directory_All_Loc__c, Suppress_from_Contact_Directory__c, 
+Suppress_from_Online_Directory_All_Loc__c, Work_Email__c, Work_Fax__c, Work_Mobile__c, 
+Work_Phone__c, Legacy_PLP_Id__c, PLP_is_Active__c, Last_Primary_Care_Location__c, 
+Site_Medical_Director__c, Roster_Update_Contact__c
+FROM AccountContactRelation
+""")
+sandbox_acr_df = pd.DataFrame(sandbox_acr_records['records'])
+
+# Step 3: Remap the AccountId and ContactId for production records to match the Sandbox environment
+# Assuming the `account_id_mapping_dict` and `contact_id_remap` (from matched_contacts_df) exist
+prod_acr_df['Remapped_AccountId'] = prod_acr_df['AccountId'].map(account_id_mapping_dict)
+prod_acr_df['Remapped_ContactId'] = prod_acr_df['ContactId'].map(contact_id_remap)
+
+# Drop records where remapping failed
+prod_acr_df = prod_acr_df.dropna(subset=['Remapped_AccountId', 'Remapped_ContactId'])
+
+# Step 4: Merge production data with sandbox data based on remapped AccountId and ContactId
+merged_acr_df = pd.merge(sandbox_acr_df, prod_acr_df, 
+                         left_on=['AccountId', 'ContactId'], 
+                         right_on=['Remapped_AccountId', 'Remapped_ContactId'], 
+                         suffixes=('_Sandbox', '_Prod'))
+
+# Step 5: Identify records in Sandbox that have missing values and need to be updated
+fields_to_check = [
+    'Roles', 'IsActive', 'StartDate', 'EndDate', 
+    'Accepting_New_Patients__c', 'Account_Contact_Type__c', 'Direct_Fax__c', 'CM_Directory_Contact__c', 
+    'Payment_Contact__c', 'Legacy_Staff_Id__c', 'Office_Staff_Role__c', 'ACRProvider_Role__c', 
+    'Suppress_from_Contact_Directory_All_Loc__c', 'Suppress_from_Contact_Directory__c', 
+    'Suppress_from_Online_Directory_All_Loc__c', 'Work_Email__c', 'Work_Fax__c', 'Work_Mobile__c', 
+    'Work_Phone__c', 'Legacy_PLP_Id__c', 'PLP_is_Active__c', 'Last_Primary_Care_Location__c', 
+    'Site_Medical_Director__c', 'Roster_Update_Contact__c'
+]
+
+# Prepare list of records to update in Sandbox
+update_records = []
+for _, row in merged_acr_df.iterrows():
+    update_record = {'Id': row['Id_Sandbox']}  # Start with the Sandbox ACR Id
+    needs_update = False
+    
+    # Check each field and update if the Sandbox value is missing (NaN) but exists in Production
+    for field in fields_to_check:
+        sandbox_value = row[f'{field}_Sandbox']
+        prod_value = row[f'{field}_Prod']
+        
+        if pd.isna(sandbox_value) and not pd.isna(prod_value):
+            update_record[field] = prod_value
+            needs_update = True
+    
+    # Add to update list if any field requires an update
+    if needs_update:
+        update_records.append(update_record)
+
+# Step 6: Perform the update in the Sandbox using the Salesforce bulk API
+if update_records:
+    try:
+        update_results = sand.bulk.AccountContactRelation.update(update_records)
+        failed_updates = [res for res in update_results if not res['success']]
+        
+        if failed_updates:
+            print(f"Failed to update {len(failed_updates)} ACR records.")
+            failed_updates_df = pd.DataFrame(failed_updates)
+            failed_updates_df.to_csv('C://Users//jkim436//Downloads//failed_acr_updates.csv', index=False)
+        
+        print(f"Successfully updated {len(update_records) - len(failed_updates)} ACR records.")
+    
+    except Exception as e:
+        print(f"An error occurred during the update of ACR records: {str(e)}")
+else:
+    print("No ACR records required updates.")
