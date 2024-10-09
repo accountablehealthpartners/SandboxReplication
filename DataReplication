@@ -173,6 +173,18 @@ account_ids = [account['Id'] for account in accounts_created_today]
 
 print(f"Found {len(account_ids)} accounts created that day.")
 
+
+
+
+
+
+
+
+
+#### Map the New AccountId to the Old AccountId values ####
+
+
+
 from simple_salesforce import Salesforce
 import pandas as pd
 
@@ -251,7 +263,13 @@ print(account_id_mapping)
 
 
 
-### Copying in the Contacts ###
+
+
+
+
+
+
+#### Copying in the Contacts ####
 
 
 
@@ -431,8 +449,82 @@ failed_contacts_df = pd.DataFrame(failed_contacts)
 print(f"Total contacts failed to insert: {len(failed_contacts)}")
 print(failed_contacts_df)
 
-# You can save the failed_contacts_df to a CSV for further analysis if needed
-#failed_contacts_df.to_csv('C://Users//jkim436//Downloads//failed_contacts.csv', index=False)
+
+
+
+
+
+
+
+
+
+#### Map the New ContactId to the Old ContactId values ####
+
+
+
+
+def construct_full_name(contact):
+    full_name = f"{contact.get('FirstName', '')} {contact.get('MiddleName', '')} {contact.get('LastName', '')} {contact.get('Suffix', '')}".strip()
+    return " ".join(full_name.split())  # Remove any extra spaces
+
+# Step 2: Pull Contact data from Production
+prod_contacts = sf.query_all("""
+SELECT Id, FirstName, MiddleName, LastName, Suffix
+FROM Contact
+""")
+
+# Create a DataFrame for production contacts and construct the full "Name"
+prod_contact_df = pd.DataFrame(prod_contacts['records'])
+prod_contact_df['FullName'] = prod_contact_df.apply(construct_full_name, axis=1)
+
+# Step 3: Pull Contact data from Sandbox
+sandbox_contacts = sand.query_all("""
+SELECT Id, FirstName, MiddleName, LastName, Suffix
+FROM Contact
+""")
+
+# Create a DataFrame for sandbox contacts and construct the full "Name"
+sandbox_contact_df = pd.DataFrame(sandbox_contacts['records'])
+sandbox_contact_df['FullName'] = sandbox_contact_df.apply(construct_full_name, axis=1)
+
+# Step 4: Perform the matching between Production and Sandbox based on "FullName"
+# We'll do a left join on the FullName field to match corresponding contacts
+matched_contacts_df = pd.merge(prod_contact_df, sandbox_contact_df, on='FullName', suffixes=('_Prod', '_Sandbox'))
+
+# Step 5: Display or save the matched DataFrame
+print(matched_contacts_df[['Id_Prod', 'Id_Sandbox', 'FullName']])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### First, check how many Account Contact Relationships are supposed to move over from the production environment ####
+
+
+
+
+
+# Query to count the number of AccountContactRelation (ACR) records
+acr_count = sf.query("SELECT COUNT() FROM AccountContactRelation")
+
+# Output the count
+print(f"Total number of ACRs in the production environment: {acr_count['totalSize']}")
+
+
+
+
+
+
+
 
 
 
@@ -516,6 +608,51 @@ if failed_remaps:
     failed_remaps_df.to_csv('C://Users//jkim436//Downloads//failed_acr_remaps.csv', index=False)
 
 print(f"Total records failed to remap: {len(failed_remaps)}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Checking how many Account Contact Relationships were successfully copied over into the Sandbox environment ####
+
+
+
+
+from datetime import datetime
+
+# Get today's date in the format required by Salesforce (YYYY-MM-DD)
+#today = datetime.today().strftime('%Y-%m-%d')
+
+# SOQL query to get Account IDs created today
+query = """
+SELECT Id FROM AccountContactRelation
+WHERE CreatedDate >= 2024-10-09T00:00:00Z AND CreatedDate < 2024-10-10T00:00:00Z
+"""
+acrs_created_today = sand.query_all(query)['records']
+acr_ids = [acr['Id'] for acr in acrs_created_today]
+
+print(f"Found {len(acr_ids)} acrs created that day.")
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -629,6 +766,13 @@ else:
 
 
 
+
+
+
+
+
+
+
 #### Copying in the Contract__c object items ####
 
 
@@ -672,7 +816,7 @@ print(f"{len(prod_contracts_records)} Contract__c records copied from Production
 
 
 
-#### Copying in the Contract_Participant__c items ####
+#### Matching up the Old AccountId and ContactId values with the Contract Participant associated New Ids ####
 
 from simple_salesforce import Salesforce
 import pandas as pd
@@ -780,8 +924,21 @@ matched_contacts_df = pd.merge(prod_contact_df, sandbox_contact_df, on='FullName
 # Step 5: Display or save the matched DataFrame
 print(matched_contacts_df[['Id_Prod', 'Id_Sandbox', 'FullName']])
 
-# Optionally, save the matched contacts to a CSV for further analysis
-matched_contacts_df[['Id_Prod', 'Id_Sandbox', 'FullName']].to_csv('C://Users//jkim436//Downloads//matched_contacts.csv', index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Copying in the Contract Participant object records ####
+
 
 
 
